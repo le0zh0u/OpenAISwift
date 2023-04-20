@@ -14,6 +14,7 @@ class ServerSentEventsHandler: NSObject {
 
     private lazy var session: URLSession = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
     private var task: URLSessionDataTask?
+    private var cacheBuffer = [String]()
 
     func connect(with request: URLRequest) {
         task = session.dataTask(with: request)
@@ -32,6 +33,25 @@ class ServerSentEventsHandler: NSObject {
             onEventReceived?(.failure(.decodingError(error: error)))
         }
     }
+    
+    // Identify half json
+    func isPartialJson(_ jsonString: String) -> Bool {
+        if jsonString.isEmpty {
+            return false
+        }
+
+        var bracesCount = 0
+        
+        for character in jsonString {
+            if character == "{" {
+                bracesCount += 1
+            } else if character == "}" {
+                bracesCount -= 1
+            }
+        }
+        
+        return bracesCount != 0
+    }
 }
 
 extension ServerSentEventsHandler: URLSessionDataDelegate {
@@ -44,11 +64,33 @@ extension ServerSentEventsHandler: URLSessionDataDelegate {
         if let eventString = String(data: data, encoding: .utf8) {
             let lines = eventString.split(separator: "\n")
             for line in lines {
-                if line.hasPrefix("data:") && line != "data: [DONE]" {
-                    if let eventData = String(line.dropFirst(5)).data(using: .utf8) {
+                if line == "data: [DONE]" {
+                    cacheBuffer.removeAll()
+                    return
+                }
+                if line.hasPrefix("data:"){
+                    let jsonData = String(line.dropFirst(5))
+                    if isPartialJson(jsonData) {
+                        cacheBuffer.append(jsonData)
+                    } else if let eventData = jsonData.data(using: .utf8) {
                         processEvent(eventData)
-                    } else {
-                        disconnect()
+                        cacheBuffer.removeAll()
+                    }
+                } else {
+                    let unknownData = String(line)
+                    if isPartialJson(unknownData) {
+                        var jsonData = ""
+                        for bufferData in cacheBuffer {
+                            jsonData.append(bufferData)
+                        }
+                        jsonData.append(unknownData)
+                        
+                        if isPartialJson(jsonData){
+                            cacheBuffer.append(unknownData)
+                        } else if let eventData = jsonData.data(using: .utf8) {
+                            processEvent(eventData)
+                            cacheBuffer.removeAll()
+                        }
                     }
                 }
             }
@@ -56,6 +98,8 @@ extension ServerSentEventsHandler: URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        cacheBuffer.removeAll()
+        
         if let error = error {
             onEventReceived?(.failure(.genericError(error: error)))
         } else {
